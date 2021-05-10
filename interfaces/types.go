@@ -9,7 +9,6 @@ type _Enum interface {
 
 type Permission interface {
 	_Enum
-	MutexPermissions() []uint32
 }
 
 type Role interface {
@@ -24,9 +23,25 @@ type Subject interface {
 }
 
 type Backend interface {
-	LastModified(ctx context.Context) (int64, int64)
-
 	GetAllPermissions(ctx context.Context) []Permission
 	GetAllRoles(ctx context.Context) []Role
 	GetSubjectRoleIDs(ctx context.Context, subject Subject) []uint32
+	NewPermission(ctx context.Context, name string) error
+	DelPermission(ctx context.Context, name string) error
+
+	NewRole(ctx context.Context, name string) error
+	DelRole(ctx context.Context, name string) error
+	RoleAddPermission(ctx context.Context, role, perm string) error
+	RoleDelPermission(ctx context.Context, role, perms string) error
+	RoleAddSuper(ctx context.Context, role, super string) error
+	RoleDelSuper(ctx context.Context, role, super string) error
+	RoleAddWildcard(ctx context.Context, role, wildcard string) error
+	RoleDelWildcard(ctx context.Context, role, wildcard string) error
+
+	SubjectAddRole(ctx context.Context, sid int64, role string) error
+	SubjectDelRole(ctx context.Context, sid int64, role string) error
+}
+
+type Auth interface {
+	Auth(ctx context.Context) (Subject, error)
 }

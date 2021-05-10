@@ -13,6 +13,19 @@ import (
 	"time"
 )
 
+type ErrorSlice []error
+
+func (es ErrorSlice) Error() string {
+	var buf strings.Builder
+	for i, e := range es {
+		buf.WriteString(e.Error())
+		if i < len(es)-1 {
+			buf.WriteString(", ")
+		}
+	}
+	return buf.String()
+}
+
 type RBAC struct {
 	sync.RWMutex
 
@@ -20,11 +33,10 @@ type RBAC struct {
 	lastLoad   int64
 	loadMaxAge int64
 
-	perms        []ifs.Permission
-	wildcards    map[string][]ifs.Permission
-	roles        []ifs.Role
-	bitmaps      map[uint32]*roaring.Bitmap
-	permMutexMap map[uint32]map[uint32]bool
+	perms     []ifs.Permission
+	wildcards map[string][]ifs.Permission
+	roles     []ifs.Role
+	bitmaps   map[uint32]*roaring.Bitmap
 
 	byID struct {
 		perms map[uint32]ifs.Permission
@@ -34,19 +46,9 @@ type RBAC struct {
 		perms map[string]ifs.Permission
 		roles map[string]ifs.Role
 	}
-	errors []error
+	errors ErrorSlice
 
 	cache map[string]*roaring.Bitmap
-}
-
-func (rbac *RBAC) addMutexPerm(a, b uint32) {
-	m := rbac.permMutexMap[a]
-	if m == nil {
-		m = map[uint32]bool{}
-		rbac.permMutexMap[a] = m
-	}
-	m[b] = true
-	rbac.addMutexPerm(b, a)
 }
 
 func (rbac *RBAC) Load(ctx context.Context) {
@@ -59,21 +61,19 @@ func (rbac *RBAC) Load(ctx context.Context) {
 	rbac.byName.roles = map[string]ifs.Role{}
 	rbac.errors = nil
 	rbac.wildcards = map[string][]ifs.Permission{}
-	rbac.permMutexMap = map[uint32]map[uint32]bool{}
 	rbac.cache = map[string]*roaring.Bitmap{}
 
 	rbac.perms = rbac.backend.GetAllPermissions(ctx)
 	for _, p := range rbac.perms {
 		rbac.byID.perms[p.ID()] = p
 		rbac.byName.perms[p.Name()] = p
-		for _, mPId := range p.MutexPermissions() {
-			rbac.addMutexPerm(p.ID(), mPId)
-		}
 	}
 
 	rbac.roles = rbac.backend.GetAllRoles(ctx)
 	rbac.bitmaps = map[uint32]*roaring.Bitmap{}
 	rbac.build()
+
+	rbac.lastLoad = time.Now().Unix()
 }
 
 func (rbac *RBAC) Errors() []error { return rbac.errors }
@@ -117,21 +117,6 @@ func (rbac *RBAC) getPermsByWildcard(name string) ([]ifs.Permission, error) {
 	return v, nil
 }
 
-func (rbac *RBAC) checkPermCollision(role string, bm *roaring.Bitmap, p uint32) error {
-	m := rbac.permMutexMap[p]
-	if len(m) < 1 {
-		return nil
-	}
-	iter := bm.Iterator()
-	for iter.HasNext() {
-		v := iter.Next()
-		if m[v] {
-			return fmt.Errorf("rbac: permission collision, `%d` and `%d`, role `%s`", p, v, role)
-		}
-	}
-	return nil
-}
-
 func (rbac *RBAC) traverse(role ifs.Role, bitmap *roaring.Bitmap, path []uint32) error {
 	if _exists(path, role.ID()) {
 		return fmt.Errorf("rbac: bad role `%s`, `%d`, path: `%v`", role.Name(), role.ID(), path)
@@ -143,9 +128,6 @@ func (rbac *RBAC) traverse(role ifs.Role, bitmap *roaring.Bitmap, path []uint32)
 			return fmt.Errorf("rbac: permission %d is not exists", pid)
 		}
 
-		if err := rbac.checkPermCollision(role.Name(), bitmap, pid); err != nil {
-			return err
-		}
 		bitmap.Add(pid)
 	}
 	for _, wildcard := range role.PermissionWildcards() {
@@ -154,9 +136,6 @@ func (rbac *RBAC) traverse(role ifs.Role, bitmap *roaring.Bitmap, path []uint32)
 			return err
 		}
 		for _, p := range matched {
-			if err := rbac.checkPermCollision(role.Name(), bitmap, p.ID()); err != nil {
-				return err
-			}
 			bitmap.Add(p.ID())
 		}
 	}
@@ -247,7 +226,7 @@ func (rbac *RBAC) getJoinedBitmap(ctx context.Context, subject ifs.Subject) (*ro
 	return bitmap, nil
 }
 
-func (rbac *RBAC) Ensure(ctx context.Context, subject ifs.Subject, policy _CheckPolicy, perms ...string) (bool, error) {
+func (rbac *RBAC) Ensure(ctx context.Context, subject ifs.Subject, policy _CheckPolicy, perms ...string) error {
 	rbac.update(ctx)
 
 	rbac.RLock()
@@ -256,7 +235,7 @@ func (rbac *RBAC) Ensure(ctx context.Context, subject ifs.Subject, policy _Check
 		p := rbac.permByName(pName)
 		if p == nil && policy == PolicyAll {
 			rbac.RUnlock()
-			return false, fmt.Errorf("rabc: permission `%s` is not exists", pName)
+			return ErrPermissionDenied
 		}
 		if p != nil {
 			pids = append(pids, p.ID())
@@ -264,64 +243,60 @@ func (rbac *RBAC) Ensure(ctx context.Context, subject ifs.Subject, policy _Check
 	}
 	rbac.RUnlock()
 	if len(pids) < 1 {
-		return false, nil
+		return ErrPermissionDenied
 	}
 
 	bitmap, err := rbac.getJoinedBitmap(ctx, subject)
 	if err != nil {
-		return false, err
+		return err
 	}
 	if bitmap == nil {
-		return false, nil
+		return ErrPermissionDenied
 	}
 
 	switch policy {
 	case PolicyAll:
 		for _, pid := range pids {
 			if !bitmap.Contains(pid) {
-				return false, nil
+				return ErrPermissionDenied
 			}
 		}
-		return true, nil
+		return nil
 	case PolicyAny:
 		for _, pid := range pids {
 			if bitmap.Contains(pid) {
-				return true, nil
+				return nil
 			}
 		}
-		return false, nil
+		return ErrPermissionDenied
 	}
-	return false, fmt.Errorf("rbac: unknown policy `%d`", policy)
+	return fmt.Errorf("rbac: s, unknown policy `%d`", policy)
 }
 
-func (rbac *RBAC) HasAll(ctx context.Context, subject ifs.Subject, perms ...string) (bool, error) {
+func (rbac *RBAC) GrantedAll(ctx context.Context, subject ifs.Subject, perms ...string) error {
 	return rbac.Ensure(ctx, subject, PolicyAll, perms...)
 }
 
-func (rbac *RBAC) HasAny(ctx context.Context, subject ifs.Subject, perms ...string) (bool, error) {
+func (rbac *RBAC) GrantedAny(ctx context.Context, subject ifs.Subject, perms ...string) error {
 	return rbac.Ensure(ctx, subject, PolicyAny, perms...)
 }
 
 var ErrPermissionDenied = errors.New("rbac: permission denied")
 
-func (rbac *RBAC) MustHasAll(ctx context.Context, subject ifs.Subject, perms ...string) {
-	ok, err := rbac.HasAll(ctx, subject, perms...)
-	if ok {
-		return
+func (rbac *RBAC) MustGrantedAll(ctx context.Context, subject ifs.Subject, perms ...string) {
+	err := rbac.GrantedAll(ctx, subject, perms...)
+	if err != nil {
+		panic(err)
 	}
-	if err == nil {
-		err = ErrPermissionDenied
-	}
-	panic(err)
 }
 
-func (rbac *RBAC) MustHasAny(ctx context.Context, subject ifs.Subject, perms ...string) {
-	ok, err := rbac.HasAny(ctx, subject, perms...)
-	if ok {
-		return
-	}
+func (rbac *RBAC) MustGrantedAny(ctx context.Context, subject ifs.Subject, perms ...string) {
+	err := rbac.GrantedAny(ctx, subject, perms...)
 	if err == nil {
-		err = ErrPermissionDenied
+		panic(err)
 	}
-	panic(err)
+}
+
+func New(backend ifs.Backend, maxAge int64) *RBAC {
+	return &RBAC{backend: backend, loadMaxAge: maxAge}
 }
