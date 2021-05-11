@@ -5,7 +5,6 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	ifs "github.com/zzztttkkk/rbac/interfaces"
 	"github.com/zzztttkkk/sqlx"
 	"io"
 	"net/http"
@@ -49,7 +48,7 @@ func errorHandler(w http.ResponseWriter, request Request, v interface{}) {
 	}
 }
 
-func makeIndex(backend ifs.Backend) Handler {
+func makeIndex(backend Backend) Handler {
 	return func(res http.ResponseWriter, req Request) {
 		if req.GetMethod() != http.MethodGet {
 			res.WriteHeader(http.StatusMethodNotAllowed)
@@ -71,7 +70,7 @@ func writeJSON(res http.ResponseWriter, data interface{}) {
 	_ = json.NewEncoder(res).Encode(data)
 }
 
-func makeGetAll(backend ifs.Backend) Handler {
+func makeGetAll(backend Backend) Handler {
 	return func(res http.ResponseWriter, req Request) {
 		if req.GetMethod() != http.MethodGet {
 			res.WriteHeader(http.StatusMethodNotAllowed)
@@ -87,8 +86,8 @@ func makeGetAll(backend ifs.Backend) Handler {
 		rbac.MustGrantedAll(ctx, req.Subject(), PermApiRead)
 
 		type Data struct {
-			Permissions []ifs.Permission
-			Roles       []ifs.Role
+			Permissions []Permission
+			Roles       []Role
 		}
 		var data Data
 		data.Permissions = backend.GetAllPermissions(ctx)
@@ -109,12 +108,12 @@ type Request interface {
 	GetContext() context.Context
 	GetMethod() string
 	GetBody() io.Reader
-	Subject() ifs.Subject
+	Subject() Subject
 }
 
 type Handler func(w http.ResponseWriter, req Request)
 
-func makeSave(backend ifs.Backend) Handler {
+func makeSave(backend Backend) Handler {
 	return func(res http.ResponseWriter, req Request) {
 		if req.GetMethod() != http.MethodPost {
 			res.WriteHeader(http.StatusMethodNotAllowed)
@@ -164,12 +163,13 @@ func check(op *Op, cID bool, cSN bool) error {
 	return nil
 }
 
-func applyOp(ctx context.Context, op *Op, backend ifs.Backend) error {
+func applyOp(ctx context.Context, op *Op, backend Backend) error {
 	if op.Type != "add" && op.Type != "del" {
 		return fmt.Errorf("rbac: unknown op type `%s`", op.Type)
 	}
 
 	var err error
+	var doLoadCheck bool
 	switch op.Column {
 	case "perm":
 		if err = check(op, false, false); err != nil {
@@ -202,6 +202,7 @@ func applyOp(ctx context.Context, op *Op, backend ifs.Backend) error {
 			err = backend.RoleDelPermission(ctx, op.Name, op.SecondName)
 		}
 	case "role.super":
+		doLoadCheck = true
 		if err = check(op, false, true); err != nil {
 			return err
 		}
@@ -212,6 +213,7 @@ func applyOp(ctx context.Context, op *Op, backend ifs.Backend) error {
 			err = backend.RoleDelSuper(ctx, op.Name, op.SecondName)
 		}
 	case "role.conflicts":
+		doLoadCheck = true
 		if err = check(op, false, true); err != nil {
 			return err
 		}
@@ -239,12 +241,15 @@ func applyOp(ctx context.Context, op *Op, backend ifs.Backend) error {
 		return err
 	}
 
-	var rbac RBAC
-	rbac.backend = backend
-	rbac.Load(ctx)
+	if doLoadCheck {
+		var rbac RBAC
+		rbac.backend = backend
+		rbac.Load(ctx)
 
-	if len(rbac.errors) > 0 {
-		return rbac.errors
+		if len(rbac.errors) > 0 {
+			return rbac.errors
+		}
+		return nil
 	}
 	return nil
 }
@@ -271,7 +276,7 @@ func wrap(handler Handler, er func(w http.ResponseWriter, r Request, v interface
 	}
 }
 
-func Register(mux Router, backend ifs.Backend, opt *Options) {
+func Register(mux Router, backend Backend, opt *Options) {
 	for _, p := range initPerms {
 		if err := backend.NewPermission(context.Background(), p); err != nil {
 			panic(err)
