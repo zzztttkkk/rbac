@@ -16,6 +16,7 @@ type Role interface {
 	SuperRoleIDs() []uint32
 	PermissionIDs() []uint32
 	PermissionWildcards() []string
+	ConflictWith() []uint32
 }
 
 type Subject interface {
@@ -26,6 +27,7 @@ type Backend interface {
 	GetAllPermissions(ctx context.Context) []Permission
 	GetAllRoles(ctx context.Context) []Role
 	GetSubjectRoleIDs(ctx context.Context, subject Subject) []uint32
+
 	NewPermission(ctx context.Context, name string) error
 	DelPermission(ctx context.Context, name string) error
 
@@ -37,11 +39,9 @@ type Backend interface {
 	RoleDelSuper(ctx context.Context, role, super string) error
 	RoleAddWildcard(ctx context.Context, role, wildcard string) error
 	RoleDelWildcard(ctx context.Context, role, wildcard string) error
+	RoleAddConflict(ctx context.Context, role, conflict string) error
+	RoleDelConflict(ctx context.Context, role, conflict string) error
 
 	SubjectAddRole(ctx context.Context, sid int64, role string) error
 	SubjectDelRole(ctx context.Context, sid int64, role string) error
-}
-
-type Auth interface {
-	Auth(ctx context.Context) (Subject, error)
 }

@@ -72,7 +72,7 @@ func (b *Backend) GetSubjectRoleIDs(ctx context.Context, subject interfaces.Subj
 		}
 		panic(err)
 	}
-	return roles
+	return roles.ToSlice()
 }
 
 func (b *Backend) idByName(ctx context.Context, op *sqlx.Operator, name string) (uint32, error) {
@@ -81,10 +81,21 @@ func (b *Backend) idByName(ctx context.Context, op *sqlx.Operator, name string) 
 		ctx, "!id",
 		"name=${name} and deleted is null", sqlx.ParamSlice{name},
 		sqlx.DirectDists{&pid},
-	); err != nil && err != sql.ErrNoRows {
+	); err != nil {
 		return 0, err
 	}
 	return pid, nil
+}
+
+func (b *Backend) mustIdByName(ctx context.Context, op *sqlx.Operator, name string) (uint32, error) {
+	v, err := b.idByName(ctx, op, name)
+	if err != nil {
+		return 0, err
+	}
+	if v == 0 {
+		return 0, sql.ErrNoRows
+	}
+	return v, nil
 }
 
 func (b *Backend) newRoleOrPerm(ctx context.Context, op *sqlx.Operator, name string) error {
@@ -145,144 +156,95 @@ func (b *Backend) DelRole(ctx context.Context, name string) error {
 	return b.delRoleOrPerm(ctx, b.role, name)
 }
 
+func (b *Backend) getRoleU32SetField(ctx context.Context, role, field string) (uint32, sqltypes.U32Set, error) {
+	rid, err := b.mustIdByName(ctx, b.role, role)
+	if err != nil {
+		return 0, nil, err
+	}
+
+	var dist sqltypes.U32Set
+	if err := b.role.Get(
+		ctx, field,
+		"id=${rid} and deleted is null", sqlx.ParamSlice{rid},
+		sqlx.DirectDists{&dist},
+	); err != nil {
+		return 0, nil, err
+	}
+	return rid, dist, nil
+}
+
+func (b *Backend) setRoleU32SetField(ctx context.Context, field string, rid uint32, v sqltypes.U32Set) error {
+	ctx, exe := sqlx.PickExecutor(ctx)
+	_, err := exe.Execute(
+		ctx,
+		fmt.Sprintf("update %s set %s=${val} where id=${id}", b.role.TableName(), field),
+		sqlx.ParamSlice{v, rid},
+	)
+	return err
+}
+
 func (b *Backend) RoleAddPermission(ctx context.Context, role, perm string) error {
-	pid, err := b.idByName(ctx, b.perm, perm)
+	pid, err := b.mustIdByName(ctx, b.perm, perm)
 	if err != nil {
 		return err
 	}
-	if pid == 0 {
-		return sql.ErrNoRows
-	}
-
-	var rid uint32
-	var perms sqltypes.U32Set
-	if err := b.role.Get(
-		ctx, "!id,permissions",
-		"name=${name} and deleted is null", sqlx.ParamSlice{role},
-		sqlx.DirectDists{&rid, &perms},
-	); err != nil {
+	rid, perms, err := b.getRoleU32SetField(ctx, role, "!permissions")
+	if err != nil {
 		return err
 	}
-	perms = append(perms, pid)
-
-	type CondArg struct {
-		Id uint32 `db:"id"`
+	if perms.Contains(pid) {
+		return nil
 	}
-	type Arg struct {
-		Permissions sqltypes.U32Set `db:"permissions"`
-	}
-	_, err = b.role.Update(ctx, "id=${id}", CondArg{Id: rid}, Arg{perms}, nil)
-	return err
+	perms.Append(pid)
+	return b.setRoleU32SetField(ctx, "permissions", rid, perms)
 }
 
 func (b *Backend) RoleDelPermission(ctx context.Context, role, perm string) error {
-	pid, err := b.idByName(ctx, b.perm, perm)
+	pid, err := b.mustIdByName(ctx, b.perm, perm)
 	if err != nil {
 		return err
 	}
-	if pid == 0 {
-		return sql.ErrNoRows
-	}
-
-	var rid uint32
-	var perms sqltypes.U32Set
-	if err := b.role.Get(
-		ctx, "!id,permissions",
-		"name=${name} and deleted is null", sqlx.ParamSlice{role},
-		sqlx.DirectDists{&rid, &perms},
-	); err != nil {
+	rid, perms, err := b.getRoleU32SetField(ctx, role, "!permissions")
+	if err != nil {
 		return err
 	}
-
-	var nPerms sqltypes.U32Set
-	for _, _id := range perms {
-		if _id != pid {
-			nPerms = append(nPerms, _id)
-		}
-	}
-
-	if len(nPerms) == len(perms) {
+	if !perms.Contains(pid) {
 		return nil
 	}
-
-	type CondArg struct {
-		Id uint32 `db:"id"`
-	}
-	type Arg struct {
-		Permissions sqltypes.U32Set `db:"permissions"`
-	}
-	_, err = b.role.Update(ctx, "id=${id}", CondArg{Id: rid}, Arg{nPerms}, nil)
-	return err
+	perms.Remove(pid)
+	return b.setRoleU32SetField(ctx, "permissions", rid, perms)
 }
 
 func (b *Backend) RoleAddSuper(ctx context.Context, role, super string) error {
-	sid, err := b.idByName(ctx, b.role, super)
+	sid, err := b.mustIdByName(ctx, b.role, super)
 	if err != nil {
 		return err
 	}
-	if sid == 0 {
-		return sql.ErrNoRows
-	}
-
-	var rid uint32
-	var supers sqltypes.U32Set
-	if err := b.role.Get(
-		ctx, "!id,supers",
-		"name=${name} and deleted is null", sqlx.ParamSlice{role},
-		sqlx.DirectDists{&rid, &supers},
-	); err != nil {
+	rid, supers, err := b.getRoleU32SetField(ctx, role, "!supers")
+	if err != nil {
 		return err
 	}
-	supers = append(supers, sid)
-
-	type CondArg struct {
-		Id uint32 `db:"id"`
+	if supers.Contains(sid) {
+		return nil
 	}
-	type Arg struct {
-		Supers sqltypes.U32Set `db:"supers"`
-	}
-	_, err = b.role.Update(ctx, "id=${id}", CondArg{rid}, Arg{supers}, nil)
-	return err
+	supers.Append(sid)
+	return b.setRoleU32SetField(ctx, "supers", rid, supers)
 }
 
 func (b *Backend) RoleDelSuper(ctx context.Context, role, super string) error {
-	sid, err := b.idByName(ctx, b.role, super)
+	sid, err := b.mustIdByName(ctx, b.role, super)
 	if err != nil {
 		return err
 	}
-	if sid == 0 {
-		return sql.ErrNoRows
-	}
-
-	var rid uint32
-	var supers sqltypes.U32Set
-	if err := b.role.Get(
-		ctx, "!id,supers",
-		"name=${name} and deleted is null", sqlx.ParamSlice{role},
-		sqlx.DirectDists{&rid, &supers},
-	); err != nil {
+	rid, supers, err := b.getRoleU32SetField(ctx, role, "!supers")
+	if err != nil {
 		return err
 	}
-
-	var nSupers sqltypes.U32Set
-	for _, _id := range supers {
-		if _id != sid {
-			nSupers = append(nSupers, _id)
-		}
-	}
-
-	if len(nSupers) == len(supers) {
+	if !supers.Contains(sid) {
 		return nil
 	}
-
-	type CondArg struct {
-		Id uint32 `db:"id"`
-	}
-	type Arg struct {
-		Supers sqltypes.U32Set `db:"supers"`
-	}
-	_, err = b.role.Update(ctx, "id=${id}", CondArg{rid}, Arg{nSupers}, nil)
-	return err
+	supers.Remove(sid)
+	return b.setRoleU32SetField(ctx, "supers", rid, supers)
 }
 
 func (b *Backend) RoleAddWildcard(ctx context.Context, role, wildcard string) error {
@@ -295,7 +257,16 @@ func (b *Backend) RoleAddWildcard(ctx context.Context, role, wildcard string) er
 	); err != nil {
 		return err
 	}
-	wcs = append(wcs, wildcard)
+	if rid == 0 {
+		return sql.ErrNoRows
+	}
+
+	if wcs.Contains(wildcard) {
+		return nil
+	}
+
+	wcs.Append(wildcard)
+
 	type CondArg struct {
 		Id uint32 `db:"id"`
 	}
@@ -316,17 +287,14 @@ func (b *Backend) RoleDelWildcard(ctx context.Context, role, wildcard string) er
 	); err != nil {
 		return err
 	}
-
-	var nWcs sqltypes.StrSet
-	for _, _id := range wcs {
-		if _id != wildcard {
-			nWcs = append(nWcs, _id)
-		}
-	}
-
-	if len(nWcs) == len(wcs) {
+	if rid == 0 {
 		return nil
 	}
+
+	if !wcs.Contains(wildcard) {
+		return nil
+	}
+	wcs.Remove(wildcard)
 
 	type CondArg struct {
 		Id uint32 `db:"id"`
@@ -334,17 +302,46 @@ func (b *Backend) RoleDelWildcard(ctx context.Context, role, wildcard string) er
 	type Arg struct {
 		Wildcards sqltypes.StrSet `db:"wildcards"`
 	}
-	_, err := b.role.Update(ctx, "id=${id}", CondArg{rid}, Arg{nWcs}, nil)
+	_, err := b.role.Update(ctx, "id=${id}", CondArg{rid}, Arg{wcs}, nil)
 	return err
 }
 
-func (b *Backend) SubjectAddRole(ctx context.Context, sid int64, role string) error {
-	rid, err := b.idByName(ctx, b.role, role)
+func (b *Backend) RoleAddConflict(ctx context.Context, role, conflict string) error {
+	cRID, err := b.mustIdByName(ctx, b.role, conflict)
 	if err != nil {
 		return err
 	}
-	if rid == 0 {
-		return sql.ErrNoRows
+	rid, conflicts, err := b.getRoleU32SetField(ctx, role, "!conflicts")
+	if err != nil {
+		return err
+	}
+	if conflicts.Contains(cRID) {
+		return nil
+	}
+	conflicts.Append(cRID)
+	return b.setRoleU32SetField(ctx, "conflicts", rid, conflicts)
+}
+
+func (b *Backend) RoleDelConflict(ctx context.Context, role, conflict string) error {
+	cRID, err := b.mustIdByName(ctx, b.role, conflict)
+	if err != nil {
+		return err
+	}
+	rid, conflicts, err := b.getRoleU32SetField(ctx, role, "!conflicts")
+	if err != nil {
+		return err
+	}
+	if !conflicts.Contains(cRID) {
+		return nil
+	}
+	conflicts.Remove(cRID)
+	return b.setRoleU32SetField(ctx, "conflicts", rid, conflicts)
+}
+
+func (b *Backend) SubjectAddRole(ctx context.Context, sid int64, role string) error {
+	rid, err := b.mustIdByName(ctx, b.role, role)
+	if err != nil {
+		return err
 	}
 
 	var roles sqltypes.U32Set
@@ -356,7 +353,10 @@ func (b *Backend) SubjectAddRole(ctx context.Context, sid int64, role string) er
 		return err
 	}
 
-	roles = append(roles, rid)
+	if roles.Contains(rid) {
+		return nil
+	}
+	roles.Append(rid)
 
 	ctx, exe := sqlx.PickExecutor(ctx)
 	var sqlInsertOrUpdate string
@@ -373,12 +373,9 @@ func (b *Backend) SubjectAddRole(ctx context.Context, sid int64, role string) er
 }
 
 func (b *Backend) SubjectDelRole(ctx context.Context, sid int64, role string) error {
-	rid, err := b.idByName(ctx, b.role, role)
+	rid, err := b.mustIdByName(ctx, b.role, role)
 	if err != nil {
 		return err
-	}
-	if rid == 0 {
-		return nil
 	}
 
 	var roles sqltypes.U32Set
@@ -393,23 +390,18 @@ func (b *Backend) SubjectDelRole(ctx context.Context, sid int64, role string) er
 		return err
 	}
 
-	var nRoles sqltypes.U32Set
-	for _, _id := range roles {
-		if _id != rid {
-			nRoles = append(nRoles, _id)
-		}
-	}
-
-	if len(nRoles) == len(roles) {
+	if !roles.Contains(rid) {
 		return nil
 	}
+	roles.Remove(rid)
+
 	type CondArg struct {
 		Id uint32 `db:"id"`
 	}
 	type Arg struct {
 		Roles sqltypes.U32Set `db:"roles"`
 	}
-	_, err = b.roles.Update(ctx, "id=${id}", CondArg{rid}, Arg{nRoles}, nil)
+	_, err = b.roles.Update(ctx, "id=${id}", CondArg{rid}, Arg{roles}, nil)
 	return err
 }
 

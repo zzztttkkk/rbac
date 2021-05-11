@@ -141,7 +141,7 @@ func makeSave(backend ifs.Backend) Handler {
 		rbac.MustGrantedAll(ctx, req.Subject(), PermApiWrite)
 
 		for ind := 0; ind < len(ops); ind++ {
-			err = applyOp(ctx, &(ops[ind]), backend, &rbac, req)
+			err = applyOp(ctx, &(ops[ind]), backend)
 			if err != nil {
 				panic(err)
 			}
@@ -164,7 +164,7 @@ func check(op *Op, cID bool, cSN bool) error {
 	return nil
 }
 
-func applyOp(ctx context.Context, op *Op, backend ifs.Backend, cRBAC *RBAC, req Request) error {
+func applyOp(ctx context.Context, op *Op, backend ifs.Backend) error {
 	if op.Type != "add" && op.Type != "del" {
 		return fmt.Errorf("rbac: unknown op type `%s`", op.Type)
 	}
@@ -172,8 +172,6 @@ func applyOp(ctx context.Context, op *Op, backend ifs.Backend, cRBAC *RBAC, req 
 	var err error
 	switch op.Column {
 	case "perm":
-		cRBAC.MustGrantedAny(ctx, req.Subject(), "rbac.write", "rbac.perm.write")
-
 		if err = check(op, false, false); err != nil {
 			return err
 		}
@@ -184,8 +182,6 @@ func applyOp(ctx context.Context, op *Op, backend ifs.Backend, cRBAC *RBAC, req 
 			err = backend.DelPermission(ctx, op.Name)
 		}
 	case "role":
-		cRBAC.MustGrantedAny(ctx, req.Subject(), "rbac.write", "rbac.role.write")
-
 		if err = check(op, false, false); err != nil {
 			return err
 		}
@@ -196,8 +192,6 @@ func applyOp(ctx context.Context, op *Op, backend ifs.Backend, cRBAC *RBAC, req 
 			err = backend.DelPermission(ctx, op.Name)
 		}
 	case "role.perm":
-		cRBAC.MustGrantedAny(ctx, req.Subject(), "rbac.write", "rbac.role.write")
-
 		if err = check(op, false, true); err != nil {
 			return err
 		}
@@ -208,8 +202,6 @@ func applyOp(ctx context.Context, op *Op, backend ifs.Backend, cRBAC *RBAC, req 
 			err = backend.RoleDelPermission(ctx, op.Name, op.SecondName)
 		}
 	case "role.super":
-		cRBAC.MustGrantedAny(ctx, req.Subject(), "rbac.write", "rbac.role.write")
-
 		if err = check(op, false, true); err != nil {
 			return err
 		}
@@ -219,9 +211,17 @@ func applyOp(ctx context.Context, op *Op, backend ifs.Backend, cRBAC *RBAC, req 
 		case "del":
 			err = backend.RoleDelSuper(ctx, op.Name, op.SecondName)
 		}
+	case "role.conflicts":
+		if err = check(op, false, true); err != nil {
+			return err
+		}
+		switch op.Type {
+		case "add":
+			err = backend.RoleAddConflict(ctx, op.Name, op.SecondName)
+		case "del":
+			err = backend.RoleDelConflict(ctx, op.Name, op.SecondName)
+		}
 	case "subject":
-		cRBAC.MustGrantedAny(ctx, req.Subject(), "rbac.write", "rbac.subject_roles.write")
-
 		if err = check(op, true, false); err != nil {
 			return err
 		}

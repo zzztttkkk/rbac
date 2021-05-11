@@ -13,9 +13,9 @@ import (
 	"time"
 )
 
-type ErrorSlice []error
+type _ErrorSlice []error
 
-func (es ErrorSlice) Error() string {
+func (es _ErrorSlice) Error() string {
 	var buf strings.Builder
 	for i, e := range es {
 		buf.WriteString(e.Error())
@@ -33,10 +33,11 @@ type RBAC struct {
 	lastLoad   int64
 	loadMaxAge int64
 
-	perms     []ifs.Permission
-	wildcards map[string][]ifs.Permission
-	roles     []ifs.Role
-	bitmaps   map[uint32]*roaring.Bitmap
+	perms         []ifs.Permission
+	wildcards     map[string][]ifs.Permission
+	roles         []ifs.Role
+	roleConflicts map[uint32]map[uint32]bool
+	bitmaps       map[uint32]*roaring.Bitmap
 
 	byID struct {
 		perms map[uint32]ifs.Permission
@@ -46,7 +47,8 @@ type RBAC struct {
 		perms map[string]ifs.Permission
 		roles map[string]ifs.Role
 	}
-	errors ErrorSlice
+	errors   _ErrorSlice
+	warnings []string
 
 	cache map[string]*roaring.Bitmap
 }
@@ -60,6 +62,7 @@ func (rbac *RBAC) Load(ctx context.Context) {
 	rbac.byName.perms = map[string]ifs.Permission{}
 	rbac.byName.roles = map[string]ifs.Role{}
 	rbac.errors = nil
+	rbac.warnings = nil
 	rbac.wildcards = map[string][]ifs.Permission{}
 	rbac.cache = map[string]*roaring.Bitmap{}
 
@@ -70,6 +73,7 @@ func (rbac *RBAC) Load(ctx context.Context) {
 	}
 
 	rbac.roles = rbac.backend.GetAllRoles(ctx)
+	rbac.roleConflicts = map[uint32]map[uint32]bool{}
 	rbac.bitmaps = map[uint32]*roaring.Bitmap{}
 	rbac.build()
 
@@ -77,6 +81,8 @@ func (rbac *RBAC) Load(ctx context.Context) {
 }
 
 func (rbac *RBAC) Errors() []error { return rbac.errors }
+
+func (rbac *RBAC) Warnings() []string { return rbac.warnings }
 
 func _exists(path []uint32, v uint32) bool {
 	for _, i := range path {
@@ -117,11 +123,21 @@ func (rbac *RBAC) getPermsByWildcard(name string) ([]ifs.Permission, error) {
 	return v, nil
 }
 
-func (rbac *RBAC) traverse(role ifs.Role, bitmap *roaring.Bitmap, path []uint32) error {
+func (rbac *RBAC) traverse(role ifs.Role, bitmap *roaring.Bitmap, path []uint32, begin ifs.Role) error {
 	if _exists(path, role.ID()) {
 		return fmt.Errorf("rbac: bad role `%s`, `%d`, path: `%v`", role.Name(), role.ID(), path)
 	}
 	path = append(path, role.ID())
+
+	if role != begin {
+		cm := rbac.roleConflicts[begin.ID()]
+		if cm[role.ID()] {
+			return fmt.Errorf("rbac: role `%s` conflict with `%s`", begin.Name(), role.Name())
+		}
+		for _, id := range role.ConflictWith() {
+			rbac.addRoleConflict(begin.ID(), id, false)
+		}
+	}
 
 	for _, pid := range role.PermissionIDs() {
 		if rbac.permByID(pid) == nil {
@@ -135,6 +151,14 @@ func (rbac *RBAC) traverse(role ifs.Role, bitmap *roaring.Bitmap, path []uint32)
 		if err != nil {
 			return err
 		}
+
+		if len(matched) < 1 {
+			rbac.warnings = append(
+				rbac.warnings,
+				fmt.Sprintf("Empty Wildcard: `%s`, on role `%s`", wildcard, role.Name()),
+			)
+		}
+
 		for _, p := range matched {
 			bitmap.Add(p.ID())
 		}
@@ -145,19 +169,44 @@ func (rbac *RBAC) traverse(role ifs.Role, bitmap *roaring.Bitmap, path []uint32)
 		if superR == nil {
 			return fmt.Errorf("rbac: role `%d` is not exists", superRID)
 		}
-		if err := rbac.traverse(superR, bitmap, path); err != nil {
+		if err := rbac.traverse(superR, bitmap, path, begin); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+func (rbac *RBAC) addRoleConflict(a, b uint32, rAdd bool) {
+	if a == b {
+		rbac.errors = append(rbac.errors, fmt.Errorf("rbac: role `%d` conflict with itself", a))
+	}
+	m := rbac.roleConflicts[a]
+	if m == nil {
+		m = map[uint32]bool{}
+		rbac.roleConflicts[a] = m
+	}
+	m[b] = true
+
+	if !rAdd {
+		rbac.addRoleConflict(b, a, true)
+	}
+}
+
 func (rbac *RBAC) build() {
 	for _, role := range rbac.roles {
+		for _, cR := range role.ConflictWith() {
+			rbac.addRoleConflict(role.ID(), cR, false)
+		}
+	}
+
+	for _, role := range rbac.roles {
 		bitmap := roaring.New()
-		if e := rbac.traverse(role, bitmap, nil); e != nil {
+		if e := rbac.traverse(role, bitmap, nil, role); e != nil {
 			rbac.errors = append(rbac.errors, e)
 		} else {
+			if bitmap.IsEmpty() {
+				rbac.warnings = append(rbac.warnings, fmt.Sprintf("Empty Role: `%s`", role.Name()))
+			}
 			rbac.bitmaps[role.ID()] = bitmap
 		}
 	}
@@ -182,6 +231,11 @@ func (rbac *RBAC) update(ctx context.Context) {
 }
 
 func (rbac *RBAC) getJoinedBitmap(ctx context.Context, subject ifs.Subject) (*roaring.Bitmap, error) {
+	roles := rbac.backend.GetSubjectRoleIDs(ctx, subject)
+	if len(roles) < 1 {
+		return nil, nil
+	}
+
 	var rUnlocked = false
 	rbac.RLock()
 	defer func() {
@@ -190,10 +244,6 @@ func (rbac *RBAC) getJoinedBitmap(ctx context.Context, subject ifs.Subject) (*ro
 		}
 	}()
 
-	roles := rbac.backend.GetSubjectRoleIDs(ctx, subject)
-	if len(roles) < 1 {
-		return nil, nil
-	}
 	if len(roles) == 1 {
 		return rbac.bitmaps[roles[0]], nil
 	}
@@ -226,11 +276,11 @@ func (rbac *RBAC) getJoinedBitmap(ctx context.Context, subject ifs.Subject) (*ro
 	return bitmap, nil
 }
 
-func (rbac *RBAC) Ensure(ctx context.Context, subject ifs.Subject, policy _CheckPolicy, perms ...string) error {
+func (rbac *RBAC) IsGranted(ctx context.Context, subject ifs.Subject, policy _CheckPolicy, perms ...string) error {
 	rbac.update(ctx)
 
 	rbac.RLock()
-	var pids []uint32
+	var requiredPermIDs []uint32
 	for _, pName := range perms {
 		p := rbac.permByName(pName)
 		if p == nil && policy == PolicyAll {
@@ -238,11 +288,11 @@ func (rbac *RBAC) Ensure(ctx context.Context, subject ifs.Subject, policy _Check
 			return ErrPermissionDenied
 		}
 		if p != nil {
-			pids = append(pids, p.ID())
+			requiredPermIDs = append(requiredPermIDs, p.ID())
 		}
 	}
 	rbac.RUnlock()
-	if len(pids) < 1 {
+	if len(requiredPermIDs) < 1 {
 		return ErrPermissionDenied
 	}
 
@@ -256,14 +306,14 @@ func (rbac *RBAC) Ensure(ctx context.Context, subject ifs.Subject, policy _Check
 
 	switch policy {
 	case PolicyAll:
-		for _, pid := range pids {
+		for _, pid := range requiredPermIDs {
 			if !bitmap.Contains(pid) {
 				return ErrPermissionDenied
 			}
 		}
 		return nil
 	case PolicyAny:
-		for _, pid := range pids {
+		for _, pid := range requiredPermIDs {
 			if bitmap.Contains(pid) {
 				return nil
 			}
@@ -273,28 +323,70 @@ func (rbac *RBAC) Ensure(ctx context.Context, subject ifs.Subject, policy _Check
 	return fmt.Errorf("rbac: s, unknown policy `%d`", policy)
 }
 
-func (rbac *RBAC) GrantedAll(ctx context.Context, subject ifs.Subject, perms ...string) error {
-	return rbac.Ensure(ctx, subject, PolicyAll, perms...)
+func (rbac *RBAC) IsGrantedAll(ctx context.Context, subject ifs.Subject, perms ...string) error {
+	return rbac.IsGranted(ctx, subject, PolicyAll, perms...)
 }
 
-func (rbac *RBAC) GrantedAny(ctx context.Context, subject ifs.Subject, perms ...string) error {
-	return rbac.Ensure(ctx, subject, PolicyAny, perms...)
+func (rbac *RBAC) IsGrantedAny(ctx context.Context, subject ifs.Subject, perms ...string) error {
+	return rbac.IsGranted(ctx, subject, PolicyAny, perms...)
 }
 
 var ErrPermissionDenied = errors.New("rbac: permission denied")
 
 func (rbac *RBAC) MustGrantedAll(ctx context.Context, subject ifs.Subject, perms ...string) {
-	err := rbac.GrantedAll(ctx, subject, perms...)
+	err := rbac.IsGrantedAll(ctx, subject, perms...)
 	if err != nil {
 		panic(err)
 	}
 }
 
 func (rbac *RBAC) MustGrantedAny(ctx context.Context, subject ifs.Subject, perms ...string) {
-	err := rbac.GrantedAny(ctx, subject, perms...)
+	err := rbac.IsGrantedAny(ctx, subject, perms...)
 	if err == nil {
 		panic(err)
 	}
+}
+
+func (rbac *RBAC) RolePermissions(ctx context.Context, role string) []ifs.Permission {
+	rbac.update(ctx)
+
+	rbac.RLock()
+	defer rbac.RUnlock()
+
+	var lst []ifs.Permission
+	r := rbac.roleByName(role)
+	if r == nil {
+		return lst
+	}
+
+	bitmap := rbac.bitmaps[r.ID()]
+	if bitmap == nil {
+		return lst
+	}
+	iter := bitmap.Iterator()
+	for iter.HasNext() {
+		lst = append(lst, rbac.permByID(iter.Next()))
+	}
+	return lst
+}
+
+func (rbac *RBAC) RoleConflict(ctx context.Context, roleIDs []uint32) []error {
+	var errs []error
+	for i, a := range roleIDs {
+		for j := i + 1; j < len(roleIDs); j++ {
+			b := roleIDs[j]
+
+			m := rbac.roleConflicts[a]
+			if m == nil {
+				errs = append(errs, fmt.Errorf("role: `%d` is not exists", a))
+				continue
+			}
+			if m[b] {
+				errs = append(errs, fmt.Errorf("role `%d` conflict with `%d`", a, b))
+			}
+		}
+	}
+	return errs
 }
 
 func New(backend ifs.Backend, maxAge int64) *RBAC {

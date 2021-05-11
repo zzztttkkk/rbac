@@ -10,9 +10,10 @@ import (
 type Role struct {
 	IDValue     uint32          `db:"id" json:"id"`
 	NameValue   string          `db:"name" json:"name"`
-	Supers      sqltypes.U32Set `db:"supers" json:"supers"`
-	Permissions sqltypes.U32Set `db:"permissions" json:"permissions"`
-	Wildcards   sqltypes.StrSet `db:"wildcards" json:"wildcards"`
+	Supers      sqltypes.U32Set `db:"supers" json:"supers,omitempty"`
+	Permissions sqltypes.U32Set `db:"permissions" json:"permissions,omitempty"`
+	Wildcards   sqltypes.StrSet `db:"wildcards" json:"wildcards,omitempty"`
+	Conflicts   sqltypes.U32Set `db:"conflicts" json:"conflicts,omitempty"`
 	Created     time.Time       `db:"created" json:"created"`
 	Deleted     *time.Time      `db:"deleted" json:"deleted,omitempty"`
 }
@@ -50,15 +51,19 @@ func (r *Role) Name() string {
 }
 
 func (r *Role) SuperRoleIDs() []uint32 {
-	return r.Supers
+	return r.Supers.ToSlice()
 }
 
 func (r *Role) PermissionIDs() []uint32 {
-	return r.Permissions
+	return r.Permissions.ToSlice()
 }
 
 func (r *Role) PermissionWildcards() []string {
-	return r.Wildcards
+	return r.Wildcards.ToSlice()
+}
+
+func (r *Role) ConflictWith() []uint32 {
+	return r.Conflicts.ToSlice()
 }
 
 var _ interfaces.Role = (*Role)(nil)
